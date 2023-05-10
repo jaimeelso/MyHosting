@@ -1,0 +1,318 @@
+##
+ # Copyright (c) Jaime Elso de Blas (https://jaimeelso.com)
+ # Follow me on twitter: @jaimeelso
+ # Check out my Github: https://github.com/jaimeelso
+ # This code is licensed under the MIT license.
+ # Created on: 10/05/2023
+ #
+ # Version 1.0 Sync CodeCommit with S3 by using a CodePipeline
+ # Version 2.0 Sync CodeCommit with S3 by using a Lambda function
+ #
+ # Description: This CloudFormation template gathers all necessary resources and their configurations to 
+ # deploy MyWebsite infraestructure for hosting
+##
+AWSTemplateFormatVersion: 2010-09-09
+Description: This CloudFormation template gathers all necessary resources and their configurations to deploy MyWebsite infraestructure.
+# Define the input parameters that will be used throughout the CloudFormation stack
+Parameters: 
+  BranchName:
+    Type: String
+    Description: Branch used to deploy the website.
+  CertificateArn:
+    Type: String
+    Description: Certificate Arn. Must be deployed in us-east-1 (N. Virginia) region.
+  DomainName:
+    Type: String
+    Description: Domain name
+  RootDocumentPath:
+    Type: String
+    Description: Path to the index file (without extension). This file will be used as the default file when a user navigates to the root of the website.
+  ErrorDocumentPath:
+    Type: String
+    Description: Path to the error document file (without extension). This file will be used as the default file when a user navigates to a non-existing page.
+  LambdaS3Bucket:
+    Type: String
+    Description: Bucket name where Lambda code is place.
+  LambdaS3Key:
+    Type: String
+    Description: Bucket key where Lambda code is place.
+  LambdaTimeout:
+    Type: Number
+    Description: Lambda timeout in seconds. Adjust this value depending on the size of the repository commits.
+  LogRetention:
+    Type: Number
+    Description: Number of days to retain S3 access server logs.
+  CSPHeader:
+    Type: String
+    Description: Content Security Policy header.
+  SubscriptionEndpoint:
+    Type: String
+    Description: The email address to which contact form messages should be sent to notify sync errors.
+# Resource section
+Resources:
+  # CodeCommit repository. This repository will be used to store the code of the website. Is the source from where the website will be deployed
+  Repository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: MyWebsite
+      RepositoryDescription: CodeCommit repository for MyWebsite
+      # For each new commit on the master branch, a new deployment on S3 will be triggered through a Lambda function
+      Triggers:
+        - Events:
+            - updateReference
+          DestinationArn: !GetAtt SyncCodeCommitWithS3Function.Arn
+          Name: SyncCodeCommitWithS3Trigger
+          Branches:
+            - !Ref BranchName
+  # Amazon Simple Notification Service topic to notify if sync process fails
+  SyncCodeCommitWithS3Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: SyncCodeCommitWithS3
+      DisplayName: SyncCodeCommitWithS3
+  # Amazon Simple Notification Service email subscription
+  SyncCodeCommitWithS3EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SyncCodeCommitWithS3Topic
+      Protocol: email
+      Endpoint: !Ref SubscriptionEndpoint
+  # AWS Lambda function role to perform all actions needed
+  SyncCodeCommitWithS3FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SyncCodeCommitWithS3FunctionRole
+      Description: Lambda Role to perform logs and sync file from CodeCommit With a S3 bucket and invalidates the CloudFront distribution cache for that files.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+  # AWS Lambda function role policy. Allows to create logs, get files from CodeCommit, put and delete files from S3 and invalidate CloudFront distribution cache
+  SyncCodeCommitWithS3FunctionRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: SyncCodeCommitWithS3FunctionRolePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${SyncCodeCommitWithS3Function}:*"
+          - Effect: Allow
+            Action: 
+              - codecommit:GetCommit
+              - codecommit:GetDifferences
+              - codecommit:GetFile
+            Resource: !GetAtt Repository.Arn
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource: !Sub '${Bucket.Arn}/*'
+          - Effect: Allow
+            Action:
+              - cloudfront:CreateInvalidation
+            Resource: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFront}'
+          - Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Ref SyncCodeCommitWithS3Topic
+      Roles:
+        - !Ref SyncCodeCommitWithS3FunctionRole
+  # AWS Lambda resource policy to allow CodeCommit to invoke the Lambda function
+  SyncCodeCommitWithS3FunctionResourcePolicy:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SyncCodeCommitWithS3Function
+      Principal: codecommit.amazonaws.com
+      SourceArn: !GetAtt Repository.Arn
+  # AWS Lambda function in Python 3.10 that sync file from CodeCommit With a S3 bucket and invalidates the CloudFront distribution cache for that files
+  SyncCodeCommitWithS3Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SyncCodeCommitWithS3
+      Description: Function that sync file from CodeCommit With a S3 bucket and invalidates the CloudFront distribution cache for that files.
+      Runtime: python3.10
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      # Timeout in seconds. Increase if you have commits with a lot of files to sync
+      Timeout: !Ref LambdaTimeout
+      # Place Lambda function code in S3 and reference it here. Zip file must contain the index.py file
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      PackageType: Zip
+      Handler: index.lambda_handler
+      Role: !GetAtt SyncCodeCommitWithS3FunctionRole.Arn
+      # Define environment variables to know the bucket name and the CloudFront distribution ID
+      Environment:
+        Variables:
+          bucketName: !Ref Bucket
+          distributionId: !Ref CloudFront
+          topicArn: !Ref SyncCodeCommitWithS3Topic
+  # Bucket to store S3 server access logging
+  BucketLogs:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${DomainName}-logs'
+      AccessControl: LogDeliveryWrite
+      # Encryption configuration with S3 managed keys
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Lifecycle configuration to expire logs after days defined in LogRetention parameter
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteLogsAfterTwoMonths
+            Status: Enabled
+            Prefix: hosting/
+            ExpirationInDays: !Ref LogRetention
+  # Hosting for MyWebsite
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DomainName
+      # Encryption configuration with S3 managed keys
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Logs configuration
+      LoggingConfiguration:
+        DestinationBucketName: !Ref BucketLogs
+        LogFilePrefix: hosting/
+  # S3 Bucket Policy to allow CloudFront to access the bucket
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource: !Sub '${Bucket.Arn}/*'
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOriginAccessIdentity.S3CanonicalUserId
+  # CloudFront distribution 
+  CloudFront:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        # Custom domain name
+        Aliases:
+          - !Ref DomainName
+        # A name for the distribution
+        Comment: !Sub 'CloudFront distribution for ${DomainName}'
+        DefaultCacheBehavior:
+          # Content will be compressed before it is cached (gzip), unless specifically instructed otherwise
+          Compress: true
+          # Cache content for 1 day
+          DefaultTTL: 86400
+          # Pass query strings to the origin
+          ForwardedValues:
+            QueryString: true
+          # Max cache content for 1 year
+          MaxTTL: 31536000
+          # Only allow HTTPS
+          ViewerProtocolPolicy: redirect-to-https
+          # Set the response headers policy
+          ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+          TargetOriginId: !Sub 'S3Bucket-${AWS::StackName}'
+        DefaultRootObject: !Ref RootDocumentPath
+        CustomErrorResponses:
+          - ErrorCachingMinTTL: 300
+            ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: !Ref ErrorDocumentPath
+          - ErrorCachingMinTTL: 300
+            ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: !Ref ErrorDocumentPath
+        IPV6Enabled: true
+        Enabled: true
+        HttpVersion: http2and3
+        # Set the origin to the S3 bucket and specify the origin access identity
+        Origins:
+          - DomainName: !GetAtt Bucket.DomainName
+            Id: !Sub 'S3Bucket-${AWS::StackName}'
+            S3OriginConfig:
+              OriginAccessIdentity:
+                !Join ['', ['origin-access-identity/cloudfront/', !Ref CloudFrontOriginAccessIdentity]]
+        # Allow CloudFront to use the all edge location
+        PriceClass: 'PriceClass_All'
+        # Set the certificate
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          MinimumProtocolVersion: 'TLSv1.1_2016'
+          SslSupportMethod: 'sni-only'
+  # CloudFront Origin Access Identity      
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'CloudFront OAI for ${DomainName}'
+  # Creates a CloudFront ResponseHeadersPolicy
+  ResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        # A name for the ResponseHeadersPolicy
+        Name: !Sub "${AWS::StackName}-static-site-security-headers"
+        # Specifies the security headers configuration
+        SecurityHeadersConfig:
+          # Specifies the Strict Transport Security (HSTS) header
+          StrictTransportSecurity:
+            # Specifies the maximum age (in seconds) for which the browser should cache the HSTS policy
+            AccessControlMaxAgeSec: 63072000
+            # Indicates whether the HSTS policy should apply to all subdomains
+            IncludeSubdomains: true
+            # Specifies whether to override an existing HSTS policy
+            Override: true
+            # Specifies whether to preload the HSTS policy in supported browsers
+            Preload: true
+          # Specifies the Content Security Policy (CSP) header
+          ContentSecurityPolicy:
+            # Specifies the CSP header value
+            ContentSecurityPolicy: !Ref CSPHeader
+            # Specifies whether to override an existing CSP policy
+            Override: true
+          # Specifies the X-Content-Type-Options header
+          ContentTypeOptions:
+            # Specifies whether to override an existing X-Content-Type-Options policy
+            Override: true
+          # Specifies the X-Frame-Options header
+          FrameOptions:
+            # Specifies the value of the X-Frame-Options header
+            FrameOption: DENY
+            # Specifies whether to override an existing X-Frame-Options policy
+            Override: true
+          # Specifies the Referrer-Policy header
+          ReferrerPolicy:
+            # Specifies the value of the Referrer-Policy header
+            ReferrerPolicy: "same-origin"
+            # Specifies whether to override an existing Referrer-Policy policy
+            Override: true
+          # Specifies the X-XSS-Protection header
+          XSSProtection:
+            # Specifies whether to block pages from loading when they detect reflected cross-site scripting (XSS) attacks
+            ModeBlock: true
+            # Specifies whether to override an existing X-XSS-Protection policy
+            Override: true
+            # Specifies whether to enable the XSS Protection policy
+            Protection: true
